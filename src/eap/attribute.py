@@ -182,7 +182,124 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
     return scores
 
-def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader: DataLoader, 
+def get_scores_eap_gp(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], steps=5, quiet=False):
+    """Gets edge attribution scores using EAP-GP (GradPath), from Zhang et al. 2025
+    ("EAP-GP: Mitigating Saturation Effect in Gradient-based Automated Circuit Identification",
+    https://arxiv.org/abs/2502.06852).
+
+    Like EAP-IG-inputs, this interpolates the model's input activations between the clean and
+    corrupted runs and averages the gradient over `steps` intermediate points. Unlike EAP-IG,
+    which uses a straight line between the corrupted and clean input activations, EAP-GP
+    constructs the path via `steps` normalized gradient-descent steps that pull the (initially
+    clean) input activations towards matching the corrupted run's output, so intermediate points
+    are chosen to avoid regions where the gradient w.r.t. the metric has saturated
+    (Algorithm 1 / Eqs. 7-9 in the paper).
+
+    Args:
+        model (HookedTransformer): The model to attribute
+        graph (Graph): Graph to attribute
+        dataloader (DataLoader): The data over which to attribute
+        metric (Callable[[Tensor], Tensor]): metric to attribute with respect to
+        steps (int, optional): number of GradPath steps (k in the paper). Defaults to 5,
+            matching the paper's main experiments.
+        quiet (bool, optional): suppress tqdm output. Defaults to False.
+
+    Returns:
+        Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
+    """
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)
+
+    total_items = 0
+    dataloader = dataloader if quiet else tqdm(dataloader)
+    for clean, corrupted, label in dataloader:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+        corrupted_tokens, _, _, n_pos_corrupted = tokenize_plus(model, corrupted)
+
+        if n_pos != n_pos_corrupted:
+            print(f"Number of positions must match, but do not: {n_pos} (clean) != {n_pos_corrupted} (corrupted)")
+            print(clean)
+            print(corrupted)
+            raise ValueError("Number of positions must match")
+
+        (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference = make_hooks_and_matrices(model, graph, batch_size, n_pos, scores)
+
+        input_node = graph.nodes['input']
+
+        with torch.inference_mode():
+            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                corrupted_logits = model(corrupted_tokens, attention_mask=attention_mask)
+
+            input_activations_corrupted = activation_difference[:, :, graph.forward_index(input_node)].clone()
+
+            with model.hooks(fwd_hooks=fwd_hooks_clean):
+                clean_logits = model(clean_tokens, attention_mask=attention_mask)
+
+            input_activations_clean = input_activations_corrupted - activation_difference[:, :, graph.forward_index(input_node)]
+
+        # Mask out padding positions so they don't pollute the GradPath objective (the paper's
+        # formulation assumes a single un-padded sequence; the model still computes -- and would
+        # otherwise let us optimize against -- logits at padded positions).
+        position_mask = (torch.arange(n_pos, device=model.cfg.device).unsqueeze(0) < input_lengths.unsqueeze(1)).unsqueeze(-1)
+        corrupted_logits_masked = corrupted_logits.detach() * position_mask
+
+        def make_input_hook(point: torch.Tensor):
+            def hook_fn(activations, hook):
+                new_input = point.clone()
+                new_input.requires_grad = True
+                return new_input
+            return hook_fn
+
+        # --- Step A: GradPath construction (Algorithm 1, part A / Eq. 8) ---
+        # gamma^G(0) = x_u, the clean input activations
+        gamma = input_activations_clean.clone().detach()
+        path_points = []
+        for _ in range(steps):
+            gamma_leaf = gamma.clone().detach().requires_grad_(True)
+            with model.hooks(fwd_hooks=[(input_node.out_hook, make_input_hook(gamma_leaf))]):
+                logits_gamma = model(clean_tokens, attention_mask=attention_mask)
+
+            diff = (logits_gamma - corrupted_logits_masked) * position_mask
+            objective = diff.pow(2).sum()
+
+            grad, = torch.autograd.grad(objective, gamma_leaf)
+            grad = grad.detach()
+            step_norm = grad.norm(p=2).clamp_min(1e-12)
+            gamma = gamma_leaf.detach() - grad / step_norm
+            path_points.append(gamma.clone())
+
+        # --- Step B: Edge attribution along the GradPath (Algorithm 1, part B / Eq. 9) ---
+        total_steps = 0
+        for step in range(steps):
+            total_steps += 1
+            with model.hooks(fwd_hooks=[(input_node.out_hook, make_input_hook(path_points[step]))], bwd_hooks=bwd_hooks):
+                logits = model(clean_tokens, attention_mask=attention_mask)
+                metric_value = metric(logits, clean_logits, input_lengths, label)
+                if torch.isnan(metric_value).any().item():
+                    print("Metric value is NaN")
+                    print(f"Clean: {clean}")
+                    print(f"Corrupted: {corrupted}")
+                    print(f"Label: {label}")
+                    print(f"Metric: {metric}")
+                    raise ValueError("Metric value is NaN")
+                metric_value.backward()
+
+            if torch.isnan(scores).any().item():
+                print("Metric value is NaN")
+                print(f"Clean: {clean}")
+                print(f"Corrupted: {corrupted}")
+                print(f"Label: {label}")
+                print(f"Metric: {metric}")
+                print(f'Step: {step}')
+                raise ValueError("Metric value is NaN")
+
+    scores /= total_items
+    scores /= total_steps
+
+    return scores
+
+def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
                               metric: Callable[[Tensor], Tensor], intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', 
                               steps=30, intervention_dataloader: Optional[DataLoader]=None, quiet=False):
 
@@ -414,10 +531,10 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
 
     return scores
 
-allowed_aggregations = {'sum', 'mean'}    
-def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], 
-              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], 
-              intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum', 
+allowed_aggregations = {'sum', 'mean'}
+def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
+              method: Literal['EAP', 'EAP-IG-inputs', 'EAP-GP', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'],
+              intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
@@ -437,6 +554,10 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for EAP-IG-inputs, but got {intervention}")
         scores = get_scores_eap_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet)
+    elif method == 'EAP-GP':
+        if intervention != 'patching':
+            raise ValueError(f"intervention must be 'patching' for EAP-GP, but got {intervention}")
+        scores = get_scores_eap_gp(model, graph, dataloader, metric, steps=ig_steps or 5, quiet=quiet)
     elif method == 'clean-corrupted':
         if intervention != 'patching':
             raise ValueError(f"intervention must be 'patching' for clean-corrupted, but got {intervention}")
@@ -450,7 +571,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
         scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader, 
                                   quiet=quiet)
     else:
-        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], but got {method}")
+        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'EAP-GP', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], but got {method}")
 
 
     if aggregation == 'mean':
