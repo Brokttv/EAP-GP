@@ -1,8 +1,8 @@
 # EAP-IG (+ EAP-GP)
 
 > **This is a fork of [hannamw/EAP-IG](https://github.com/hannamw/EAP-IG)** (Michael Hanna's library
-> for circuit-finding in transformer LMs, MIT licensed, see `LICENSE`). Everything below the
-> "Changes in this fork" section is the original upstream README, describing the base library
+> for circuit-finding in transformer LMs, MIT licensed, see `LICENSE`). Please visit their repo
+>  describing the base library
 > this fork builds on.
 >
 > **What this fork adds:** an implementation of **EAP-GP** ("Edge Attribution Patching with
