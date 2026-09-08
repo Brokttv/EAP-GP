@@ -18,6 +18,10 @@ Commits on top of upstream, all mine:
 - [`tests/test_gradpath_mechanic.py`](tests/test_gradpath_mechanic.py): a new, dependency-light
   sanity test (plain PyTorch, no `transformer_lens`/GPU needed) that isolates and checks the one
   genuinely new mechanic EAP-GP introduces.
+- [`tests/test_eap_gp_smoke.py`](tests/test_eap_gp_smoke.py): a new integration smoke test that
+  runs EAP, EAP-IG, and EAP-GP against real GPT-2 small on the repo's own greater-than task, and
+  checks for crashes, NaNs, and dead (all-zero) score tensors. Needs `transformer_lens` and a
+  CUDA GPU. See "Testing" below.
 - This `README.md`: rewritten to document the fork and the new method, while keeping the
   original library's docs intact below.
 
@@ -120,24 +124,53 @@ supersede the reading above. The per-input-only approximation here is an inferen
 method description, matched to the paper's reported runtime, not something the paper states
 outright.
 
-### Sanity check
+### Testing
 
-`get_scores_eap_gp`'s only genuinely new mechanic relative to EAP-IG is Step A: injecting a
-`requires_grad` leaf mid-forward-pass via a hook, backpropagating a *different* objective
-($\lVert G(\cdot) - G(x_u') \rVert^2$, not the task metric $L$) through it, and taking a
-normalized step. [`tests/test_gradpath_mechanic.py`](tests/test_gradpath_mechanic.py) exercises
-exactly that pattern against a small synthetic network (no transformer_lens/GPU needed) and
+There are two tests, covering two different things. Run both before trusting EAP-GP results in
+an experiment, and definitely before handing this off to a collaborator to run at scale.
+
+**1. The GradPath mechanic, in isolation.** `get_scores_eap_gp`'s only genuinely new piece
+relative to EAP-IG is Step A: injecting a `requires_grad` leaf mid-forward-pass via a hook,
+backpropagating a *different* objective ($\lVert G(\cdot) - G(x_u') \rVert^2$, not the task
+metric $L$) through it, and taking a normalized step.
+[`tests/test_gradpath_mechanic.py`](tests/test_gradpath_mechanic.py) exercises exactly that
+pattern against a small synthetic network (plain PyTorch, no transformer_lens or GPU needed) and
 asserts the objective decreases monotonically and every path point is finite and distinct:
 
 ```bash
 python tests/test_gradpath_mechanic.py
 ```
 
-This does **not** test `get_scores_eap_gp` itself end-to-end (that needs `transformer_lens` and,
-as-written, same as every other method in this library, a CUDA GPU, since `attribute.py`
-hardcodes `device='cuda'` for its score tensors). Run it against a real model/task before trusting
-results; treat this as an implementation-from-the-paper you should verify, not a port of code the
-authors published.
+This only checks the autograd trick works in principle. It does **not** touch a real model, so it
+can't catch bugs in how the hooks interact with a real `HookedTransformer`'s actual attention/MLP
+graph.
 
+**2. `get_scores_eap_gp` against a real model.** [`tests/test_eap_gp_smoke.py`](tests/test_eap_gp_smoke.py)
+runs EAP, EAP-IG-inputs, and EAP-GP on GPT-2 small against the repo's own greater-than task
+(`greater_than_data.csv`, already in this repo). Needs `transformer_lens` and a CUDA GPU (every
+method in this library hardcodes `device='cuda'` for its score tensors, not just EAP-GP):
 
+```bash
+python tests/test_eap_gp_smoke.py
+```
+
+It checks the basics: no crash, no NaNs, no all-zero (dead) score tensor, and that EAP-GP's
+runtime is in a sane ballpark relative to EAP-IG (the paper reports ~5x; the test only flags
+something above 20x, as a loose tripwire rather than a tight bound). If any of those fail, there's
+a real bug, don't proceed to a full experiment.
+
+If it passes, that still only means the code *runs*, not that the scores are *correct*. Before
+trusting numbers for the paper:
+- Compare the printed `circuit_perf_top50` for EAP-GP against EAP-IG-inputs at the same top-n. On
+  the paper's own GPT-2-small results, EAP-GP should do as well as or better than EAP-IG at
+  matched circuit sizes; a much worse result is a signal something in the implementation (likely
+  the per-input-only approximation described above) doesn't hold on your task.
+  It's also fine, and worth doing, to run the same check on the residual-stream-node-level task
+  you actually care about for the paper, not just this smoke test's greater-than task.
+- Try a couple of different `ig_steps` values (the paper explores $k \in [3, 20]$, and reports
+  $k=5$ as their main setting). Wildly unstable results across nearby $k$ would be a red flag.
+- If you want a closer check against the paper's own headline numbers (GPT-2 small, IOI, ~80%
+  NFS for EAP-GP vs. ~62% for EAP-IG at 97.5% sparsity), you'll need to set up the IOI task and
+  the Normalized Faithfulness Score metric yourself. This repo ships a greater-than dataset out of
+  the box, not IOI-for-GPT-2, so that comparison needs more setup than the smoke test above.
 
