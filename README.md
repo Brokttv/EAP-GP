@@ -1,4 +1,4 @@
-# EAP-IG (+ EAP-GP)
+# EAP-GP
 
 > **This is a fork of [hannamw/EAP-IG](https://github.com/hannamw/EAP-IG)** (Michael Hanna's library
 > for circuit-finding in transformer LMs, MIT licensed, see `LICENSE`). Please visit their repo
