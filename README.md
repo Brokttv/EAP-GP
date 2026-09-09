@@ -154,8 +154,7 @@ python tests/test_eap_gp_smoke.py
 
 It checks the basics: no crash, no NaNs, no all-zero (dead) score tensor, and that EAP-GP's
 runtime is in a sane ballpark relative to EAP-IG (the paper reports ~5x; the test only flags
-something above 20x, as a loose tripwire rather than a tight bound). If any of those fail, there's
-a real bug, don't proceed to a full experiment.
+something above 20x, as a loose tripwire rather than a tight bound).
 
 
 
