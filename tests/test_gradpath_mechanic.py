@@ -9,6 +9,17 @@ This mimics the hook pattern used in src/eap/attribute.py:get_scores_eap_gp:
   - we take a unit-normalized step against the gradient
   - we repeat for k steps and confirm the objective (dist to corrupted output)
     generally decreases and the loop produces finite, distinct path points.
+
+An earlier version of this file called the toy network directly on the leaf
+tensor (`G(gamma_leaf)`), never exercising an actual hook-shaped function that
+receives the model's own activation and must RETURN a substitute. That gap let
+a real bug through: attribute.py's shared hook did `point.clone();
+new_input.requires_grad = True` unconditionally, which is illegal once `point`
+already requires grad (a clone of a grad-requiring leaf is a non-leaf, and
+PyTorch forbids setting .requires_grad on non-leaves) -- exactly Step A's call
+site. It surfaced on the first real H100 run against GPT-2, not here, because
+this test didn't route through a hook shape at all. Section 3 below closes
+that gap by exercising both hook call sites explicitly.
 """
 import torch
 import torch.nn as nn
@@ -74,3 +85,39 @@ for point in path_points:
 
 print("accumulated (toy) attribution scores:", scores_accum)
 print("OK: GradPath autograd mechanic behaves as expected.")
+
+# --- Section 3: exercise the actual hook shape used against a real HookedTransformer ---
+# A real hook receives the model's own activation tensor and must return a substitute;
+# it can't just call G(leaf) directly. That return-a-substitute shape is exactly where
+# attribute.py's leaf/non-leaf bug lived, so replicate it here instead of bypassing it.
+
+def make_grad_leaf_input_hook(leaf: torch.Tensor):
+    def hook_fn(placeholder_activation):
+        return leaf.clone()
+    return hook_fn
+
+def make_detached_input_hook(point: torch.Tensor):
+    def hook_fn(placeholder_activation):
+        return point.clone().requires_grad_(True)
+    return hook_fn
+
+placeholder = torch.zeros(batch, pos, d_model)  # stands in for the real activation tensor
+
+# Step A's call site: the substituted tensor already requires grad.
+grad_leaf = x_clean.clone().detach().requires_grad_(True)
+hooked_input = make_grad_leaf_input_hook(grad_leaf)(placeholder)
+out = G(hooked_input)
+objective = (out - G_corrupted).pow(2).sum()
+grad, = torch.autograd.grad(objective, grad_leaf)
+assert torch.isfinite(grad).all(), "Step A hook: gradient did not flow back to the leaf"
+
+# Step B's call site: the substituted tensor is a detached snapshot with no grad history.
+detached_point = x_clean.clone().detach()
+hooked_input_b = make_detached_input_hook(detached_point)(placeholder)
+assert hooked_input_b.requires_grad, "Step B hook: substitute should require grad"
+out_b = G(hooked_input_b)
+out_b.sum().backward()
+assert hooked_input_b.grad is not None and torch.isfinite(hooked_input_b.grad).all()
+
+print("OK: hook-shaped substitution works for both the grad-requiring-leaf call site "
+      "(Step A) and the detached-point call site (Step B).")
