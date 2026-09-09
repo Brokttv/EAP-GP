@@ -157,18 +157,5 @@ runtime is in a sane ballpark relative to EAP-IG (the paper reports ~5x; the tes
 something above 20x, as a loose tripwire rather than a tight bound). If any of those fail, there's
 a real bug, don't proceed to a full experiment.
 
-If it passes, that still only means the code *runs*, not that the scores are *correct*. Before
-trusting numbers for the paper:
-- Compare the printed `circuit_perf_top50` for EAP-GP against EAP-IG-inputs at the same top-n. On
-  the paper's own GPT-2-small results, EAP-GP should do as well as or better than EAP-IG at
-  matched circuit sizes; a much worse result is a signal something in the implementation (likely
-  the per-input-only approximation described above) doesn't hold on your task.
-  It's also fine, and worth doing, to run the same check on the residual-stream-node-level task
-  you actually care about for the paper, not just this smoke test's greater-than task.
-- Try a couple of different `ig_steps` values (the paper explores $k \in [3, 20]$, and reports
-  $k=5$ as their main setting). Wildly unstable results across nearby $k$ would be a red flag.
-- If you want a closer check against the paper's own headline numbers (GPT-2 small, IOI, ~80%
-  NFS for EAP-GP vs. ~62% for EAP-IG at 97.5% sparsity), you'll need to set up the IOI task and
-  the Normalized Faithfulness Score metric yourself. This repo ships a greater-than dataset out of
-  the box, not IOI-for-GPT-2, so that comparison needs more setup than the smoke test above.
+
 
