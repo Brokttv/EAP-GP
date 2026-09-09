@@ -244,11 +244,22 @@ def get_scores_eap_gp(model: HookedTransformer, graph: Graph, dataloader: DataLo
         position_mask = (torch.arange(n_pos, device=model.cfg.device).unsqueeze(0) < input_lengths.unsqueeze(1)).unsqueeze(-1)
         corrupted_logits_masked = corrupted_logits.detach() * position_mask
 
-        def make_input_hook(point: torch.Tensor):
+        def make_grad_leaf_input_hook(leaf: torch.Tensor):
+            # `leaf` already requires grad (Step A). A clone of a grad-requiring tensor is a
+            # non-leaf connected to it via CloneBackward -- exactly what we want so
+            # torch.autograd.grad(objective, leaf) can see through the hook, but it means we
+            # must NOT touch .requires_grad on the clone: that's only settable on leaves, and
+            # doing it anyway raises "you can only change requires_grad flags of leaf variables".
             def hook_fn(activations, hook):
-                new_input = point.clone()
-                new_input.requires_grad = True
-                return new_input
+                return leaf.clone()
+            return hook_fn
+
+        def make_detached_input_hook(point: torch.Tensor):
+            # `point` is a detached snapshot with no grad history (Step B). Cloning it gives a
+            # fresh, ordinary tensor with requires_grad=False, which IS a leaf, so marking it
+            # to require grad here is legal and is what makes it a target for autograd.grad.
+            def hook_fn(activations, hook):
+                return point.clone().requires_grad_(True)
             return hook_fn
 
         # --- Step A: GradPath construction (Algorithm 1, part A / Eq. 8) ---
@@ -257,7 +268,7 @@ def get_scores_eap_gp(model: HookedTransformer, graph: Graph, dataloader: DataLo
         path_points = []
         for _ in range(steps):
             gamma_leaf = gamma.clone().detach().requires_grad_(True)
-            with model.hooks(fwd_hooks=[(input_node.out_hook, make_input_hook(gamma_leaf))]):
+            with model.hooks(fwd_hooks=[(input_node.out_hook, make_grad_leaf_input_hook(gamma_leaf))]):
                 logits_gamma = model(clean_tokens, attention_mask=attention_mask)
 
             diff = (logits_gamma - corrupted_logits_masked) * position_mask
@@ -273,7 +284,7 @@ def get_scores_eap_gp(model: HookedTransformer, graph: Graph, dataloader: DataLo
         total_steps = 0
         for step in range(steps):
             total_steps += 1
-            with model.hooks(fwd_hooks=[(input_node.out_hook, make_input_hook(path_points[step]))], bwd_hooks=bwd_hooks):
+            with model.hooks(fwd_hooks=[(input_node.out_hook, make_detached_input_hook(path_points[step]))], bwd_hooks=bwd_hooks):
                 logits = model(clean_tokens, attention_mask=attention_mask)
                 metric_value = metric(logits, clean_logits, input_lengths, label)
                 if torch.isnan(metric_value).any().item():
