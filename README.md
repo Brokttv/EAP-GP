@@ -22,8 +22,6 @@ Commits on top of upstream, all mine:
   runs EAP, EAP-IG, and EAP-GP against real GPT-2 small on the repo's own greater-than task, and
   checks for crashes, NaNs, and dead (all-zero) score tensors. Needs `transformer_lens` and a
   CUDA GPU. See "Testing" below.
-- This `README.md`: rewritten to document the fork and the new method, while keeping the
-  original library's docs intact below.
 
 ## EAP-GP (GradPath)
 
