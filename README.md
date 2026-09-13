@@ -5,7 +5,7 @@
 >  describing the base library
 > this fork builds on.
 >
-> **What this fork adds:** an implementation of [**EAP-GP**](https://arxiv.org/html/2502.06852v1) ("Edge Attribution Patching with
+> **What this fork adds:** an implementation of **[EAP-GP](https://arxiv.org/html/2502.06852v1)** ("Edge Attribution Patching with
 > GradPath"), a new attribution method from Zhang et al. 2025 that has no public code release.
 > See [EAP-GP (GradPath)](#eap-gp-gradpath) below.
 
